@@ -5,7 +5,7 @@ from diffusers import StableDiffusionXLPipeline, StableDiffusion3Pipeline
 
 import configs.envs
 from configs import benchmark
-from methods.dos import DOS, SDXLTextEncoder, SD3_5TextEncoder
+from methods.dynamic_dos import DynamicDOS, DynamicDOSMasker, SDXLTextEncoder, SD3_5TextEncoder
 
 
 def parse_args():
@@ -15,12 +15,15 @@ def parse_args():
     parser.add_argument("--dataset")
     parser.add_argument("--method")
     parser.add_argument("--seed_range", type=int, nargs=2, help="tuple input with two values. ex) 1 3")
+    parser.add_argument("--num_inference_steps", type=int, default=50)
 
     #### experimental arguments ####
     parser.add_argument("--lambda_sep", type=float, default=1.0, help="[experiment] only for ablation study")
     parser.add_argument("--disable_separating_object_embedding", action="store_true", help="[experiment] only for ablation study")
     parser.add_argument("--disable_separating_eot_embedding", action="store_true", help="[experiment] only for ablation study")
     parser.add_argument("--disable_separating_pooled_embedding", action="store_true", help="[experiment] only for ablation study")
+    parser.add_argument("--schedule_type", type=str, default="constant", choices=["constant", "linear", "cosine", "step"])
+    parser.add_argument("--tau", type=float, default=None, help="Cutoff for step schedule. If <=1, interpreted as normalized tau; if >1, interpreted as absolute step index.")
 
     args = parser.parse_args()
     return args
@@ -79,7 +82,7 @@ def load_pipeline(args):
 
 def default(pipe, seed, target_prompt, target_objects, args):
     generator = torch.Generator(args.device).manual_seed(seed)
-    image = pipe(prompt=[target_prompt], generator=generator).images[0]
+    image = pipe(prompt=[target_prompt], generator=generator, num_inference_steps=args.num_inference_steps).images[0]
     return image
 
 
@@ -87,10 +90,34 @@ def dos_sdxl(pipe, seed, target_prompt, target_objects, args):
     text_embeddings, _, pooled_text_embeddings, _ = pipe.encode_prompt([target_prompt])
     text_embeddings, pooled_text_embeddings = text_embeddings.clone().detach(), pooled_text_embeddings.clone().detach()
     text_encoder = SDXLTextEncoder(pipe=pipe)
-    text_embeddings, pooled_text_embeddings = _dos(pipe, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, args, text_encoder)
+    base_text_embeddings, base_pooled_text_embeddings, separating_vector_text, separating_vector_pooled = _dos(
+        pipe, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, args, text_encoder
+    )
+
+    masker = DynamicDOSMasker(schedule_type=args.schedule_type, tau=args.tau)
+    dynamic_dos = DynamicDOS(pipe=pipe, text_encoder=text_encoder, device=args.device)
+    callback = dynamic_dos.make_callback_on_step_end(
+        base_prompt_embeds=base_text_embeddings,
+        base_pooled_embeds=base_pooled_text_embeddings,
+        separation_prompt=separating_vector_text,
+        separation_pooled=separating_vector_pooled,
+        masker=masker,
+        num_inference_steps=args.num_inference_steps,
+    )
+
+    alpha_init = masker.alpha_from_step(step_index=0, total_steps=args.num_inference_steps)
+    init_text_embeddings = base_text_embeddings + (alpha_init * separating_vector_text)
+    init_pooled_embeddings = base_pooled_text_embeddings + (alpha_init * separating_vector_pooled)
 
     generator = torch.Generator(args.device).manual_seed(seed)
-    image = pipe(prompt_embeds=text_embeddings, pooled_prompt_embeds=pooled_text_embeddings, generator=generator).images[0]
+    image = pipe(
+        prompt_embeds=init_text_embeddings,
+        pooled_prompt_embeds=init_pooled_embeddings,
+        generator=generator,
+        num_inference_steps=args.num_inference_steps,
+        callback_on_step_end=callback,
+        callback_on_step_end_tensor_inputs=["prompt_embeds", "pooled_prompt_embeds"],
+    ).images[0]
     return image
 
 
@@ -98,17 +125,41 @@ def dos_sd3_5(pipe, seed, target_prompt, target_objects, args):
     text_embeddings, _, pooled_text_embeddings, _ = pipe.encode_prompt([target_prompt], None, None)
     text_embeddings, pooled_text_embeddings = text_embeddings.clone().detach(), pooled_text_embeddings.clone().detach()
     text_encoder = SD3_5TextEncoder(pipe=pipe)
-    text_embeddings, pooled_text_embeddings = _dos(pipe, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, args, text_encoder)
+    base_text_embeddings, base_pooled_text_embeddings, separating_vector_text, separating_vector_pooled = _dos(
+        pipe, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, args, text_encoder
+    )
+
+    masker = DynamicDOSMasker(schedule_type=args.schedule_type, tau=args.tau)
+    dynamic_dos = DynamicDOS(pipe=pipe, text_encoder=text_encoder, device=args.device)
+    callback = dynamic_dos.make_callback_on_step_end(
+        base_prompt_embeds=base_text_embeddings,
+        base_pooled_embeds=base_pooled_text_embeddings,
+        separation_prompt=separating_vector_text,
+        separation_pooled=separating_vector_pooled,
+        masker=masker,
+        num_inference_steps=args.num_inference_steps,
+    )
+
+    alpha_init = masker.alpha_from_step(step_index=0, total_steps=args.num_inference_steps)
+    init_text_embeddings = base_text_embeddings + (alpha_init * separating_vector_text)
+    init_pooled_embeddings = base_pooled_text_embeddings + (alpha_init * separating_vector_pooled)
 
     generator = torch.Generator(args.device).manual_seed(seed)
-    image = pipe(prompt_embeds=text_embeddings, pooled_prompt_embeds=pooled_text_embeddings, generator=generator).images[0]
+    image = pipe(
+        prompt_embeds=init_text_embeddings,
+        pooled_prompt_embeds=init_pooled_embeddings,
+        generator=generator,
+        num_inference_steps=args.num_inference_steps,
+        callback_on_step_end=callback,
+        callback_on_step_end_tensor_inputs=["prompt_embeds", "pooled_prompt_embeds"],
+    ).images[0]
     return image
 
 
 def _dos(pipe, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, args, text_encoder):
-    embedding_calibrator = DOS(pipe=pipe, text_encoder=text_encoder, device=args.device)
+    embedding_calibrator = DynamicDOS(pipe=pipe, text_encoder=text_encoder, device=args.device)
 
-    text_embeddings, pooled_text_embeddings = embedding_calibrator.update_text_embeddings(
+    base_text_embeddings, base_pooled_text_embeddings, separating_vector_text, separating_vector_pooled = embedding_calibrator.compute_separation_vectors(
         target_prompt=target_prompt,
         target_objects=target_objects,
         text_embeddings=text_embeddings, 
@@ -118,7 +169,7 @@ def _dos(pipe, target_prompt, target_objects, text_embeddings, pooled_text_embed
         separating_pooled_embedding=not args.disable_separating_pooled_embedding if hasattr(args, 'disable_separating_pooled_embedding') else True,
         lambda_sep=args.lambda_sep
     )
-    return text_embeddings, pooled_text_embeddings
+    return base_text_embeddings, base_pooled_text_embeddings, separating_vector_text, separating_vector_pooled
 
 
 if __name__=="__main__":
