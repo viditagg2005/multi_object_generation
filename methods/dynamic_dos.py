@@ -150,11 +150,40 @@ class SD3_5TextEncoder(TextEncoder):
         return text_embeddings
 
 
-class DOS:
-    def __init__(self, pipe, text_encoder, device):
+class DynamicDOS:
+    SUPPORTED = {"constant", "linear", "cosine", "step"}
+
+    def __init__(self, pipe, text_encoder, device, schedule_type="constant", tau=None):
         self.pipe = pipe
         self.text_encoder = text_encoder
         self.device = device
+        if schedule_type not in self.SUPPORTED:
+            raise ValueError(f"Invalid schedule_type: {schedule_type}. Expected one of: {sorted(self.SUPPORTED)}")
+        self.schedule_type = schedule_type
+        self.tau = tau
+
+    def _resolve_tau(self, total_steps):
+        if self.tau is None:
+            return 0.5
+        if self.tau > 1.0:
+            denom = max(total_steps - 1, 1)
+            return max(0.0, min(1.0, self.tau / denom))
+        return max(0.0, min(1.0, self.tau))
+
+    def alpha_from_step(self, step_index, total_steps):
+        import math
+        denom = max(total_steps - 1, 1)
+        normalized_t = max(0.0, min(1.0, 1.0 - (float(step_index) / float(denom))))
+
+        if self.schedule_type == "constant":
+            return 1.0
+        if self.schedule_type == "linear":
+            return normalized_t
+        if self.schedule_type == "cosine":
+            return 0.5 * (1.0 - math.cos(math.pi * normalized_t))
+
+        tau = self._resolve_tau(total_steps)
+        return 1.0 if normalized_t > tau else 0.0
 
     def validate_prompt(self, target_prompt, target_objects):
         if type(target_prompt) == list:
@@ -307,39 +336,7 @@ class DOS:
         return text_embeddings.clone().detach(), pooled_text_embeddings.clone().detach()
 
 
-class DynamicDOSMasker:
-    SUPPORTED = {"constant", "linear", "cosine", "step"}
 
-    def __init__(self, schedule_type="constant", tau=None):
-        if schedule_type not in self.SUPPORTED:
-            raise ValueError(f"Invalid schedule_type: {schedule_type}. Expected one of: {sorted(self.SUPPORTED)}")
-        self.schedule_type = schedule_type
-        self.tau = tau
-
-    def _resolve_tau(self, total_steps):
-        if self.tau is None:
-            return 0.5
-        if self.tau > 1.0:
-            denom = max(total_steps - 1, 1)
-            return max(0.0, min(1.0, self.tau / denom))
-        return max(0.0, min(1.0, self.tau))
-
-    def alpha_from_step(self, step_index, total_steps):
-        denom = max(total_steps - 1, 1)
-        normalized_t = max(0.0, min(1.0, 1.0 - (float(step_index) / float(denom))))
-
-        if self.schedule_type == "constant":
-            return 1.0
-        if self.schedule_type == "linear":
-            return normalized_t
-        if self.schedule_type == "cosine":
-            return 0.5 * (1.0 - math.cos(math.pi * normalized_t))
-
-        tau = self._resolve_tau(total_steps)
-        return 1.0 if normalized_t > tau else 0.0
-
-
-class DynamicDOS(DOS):
     def compute_separation_vectors(self, target_prompt, target_objects, text_embeddings, pooled_text_embeddings, **config):
         base_prompt_embeds = text_embeddings.clone().detach()
         base_pooled_embeds = pooled_text_embeddings.clone().detach()
@@ -366,11 +363,10 @@ class DynamicDOS(DOS):
 
         return scaled.to(device=current_embeddings.device, dtype=current_embeddings.dtype)
 
-    def make_callback_on_step_end(self, base_prompt_embeds, base_pooled_embeds, separation_prompt, separation_pooled,
-                                  masker, num_inference_steps):
+    def make_callback_on_step_end(self, base_prompt_embeds, base_pooled_embeds, separation_prompt, separation_pooled, num_inference_steps=50):
         def _callback_on_step_end(pipe, step_index, timestep, callback_kwargs):
             next_step = min(step_index + 1, num_inference_steps - 1)
-            alpha = masker.alpha_from_step(next_step, num_inference_steps)
+            alpha = self.alpha_from_step(next_step, num_inference_steps)
 
             if "prompt_embeds" in callback_kwargs:
                 callback_kwargs["prompt_embeds"] = self._inject_conditional_embeddings(
@@ -383,6 +379,14 @@ class DynamicDOS(DOS):
             if "pooled_prompt_embeds" in callback_kwargs:
                 callback_kwargs["pooled_prompt_embeds"] = self._inject_conditional_embeddings(
                     current_embeddings=callback_kwargs["pooled_prompt_embeds"],
+                    base_embeddings=base_pooled_embeds,
+                    separation_vector=separation_pooled,
+                    alpha=alpha,
+                )
+                
+            if "add_text_embeds" in callback_kwargs:
+                callback_kwargs["add_text_embeds"] = self._inject_conditional_embeddings(
+                    current_embeddings=callback_kwargs["add_text_embeds"],
                     base_embeddings=base_pooled_embeds,
                     separation_vector=separation_pooled,
                     alpha=alpha,
